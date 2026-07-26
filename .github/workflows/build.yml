@@ -172,16 +172,34 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: qscripts-*
-          path: release
+          path: dist
           merge-multiple: true
 
-      - name: Package release
+      - name: Package per-IDA-version zips
+        shell: bash
         run: |
-          cp ida-plugin.json release/ || echo "no ida-plugin.json"
-          cd release
-          ls -la
-          zip -9 qscripts-${{ github.ref_name }}.zip qscripts-* ida-plugin.json
-          ls -lh *.zip
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          # Map SDK tag -> IDA version used in the zip name.
+          declare -A IDAVER=( [v9.2.0-sdk.1]=9.2 [v9.3.1-sdk.1]=9.3 [v9.4.0-release]=9.4 )
+          mkdir -p out
+          cd dist
+          # Stage each binary into ida<ver>/<os>-<arch>/qscripts.<ext>
+          for f in qscripts-*-*-*.*; do
+            base="${f#qscripts-}"; os="${base%%-*}"; rest="${base#*-}"
+            arch="${rest%%-*}"; rest2="${rest#*-}"; ext="${rest2##*.}"; sdk="${rest2%.*}"
+            ida="${IDAVER[$sdk]:-}"
+            if [ -z "$ida" ]; then echo "skip (unknown SDK): $f"; continue; fi
+            osl="$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')"
+            d="ida${ida}/${osl}-${arch}"; mkdir -p "$d"; cp "$f" "$d/qscripts.${ext}"
+          done
+          # One zip per IDA version, each with ida-plugin.json at the root.
+          for d in ida*/; do
+            ida="${d%/}"; cp ../ida-plugin.json "$ida/"
+            ( cd "$ida" && zip -9 -r "../../out/qscripts-${TAG}-${ida}.zip" . )
+          done
+          cd ..
+          echo "=== release assets ==="; ls -lh out
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -191,5 +209,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: |
-            release/qscripts-${{ github.ref_name }}.zip
+          files: out/qscripts-${{ github.ref_name }}-ida*.zip
