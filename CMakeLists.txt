@@ -17,46 +17,35 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include($ENV{IDASDK}/ida-cmake/bootstrap.cmake)
 find_package(idasdk REQUIRED)
 
-# Resolve idacpp: optional local path (-DIDACPP_PATH) -> IDASDK -> FetchContent
-set(IDACPP_PATH "" CACHE PATH "Optional path to a local idacpp checkout")
-set(IDACPP_SDK_PATH   "$ENV{IDASDK}/include/idacpp")
-set(IDACPP_LOCAL_PATH "${CMAKE_CURRENT_BINARY_DIR}/idacpp")
-
-if(IDACPP_PATH AND EXISTS "${IDACPP_PATH}/CMakeLists.txt")
-    message(STATUS "Using idacpp from IDACPP_PATH: ${IDACPP_PATH}")
-    add_subdirectory(${IDACPP_PATH} ${CMAKE_CURRENT_BINARY_DIR}/idacpp)
-elseif(EXISTS "${IDACPP_SDK_PATH}/CMakeLists.txt")
-    message(STATUS "Using idacpp from IDASDK: ${IDACPP_SDK_PATH}")
-    add_subdirectory(${IDACPP_SDK_PATH} ${CMAKE_CURRENT_BINARY_DIR}/idacpp)
+# Resolve libidacpp: use a local ../libidacpp if present, otherwise fetch it.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libidacpp/CMakeLists.txt")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libidacpp ${CMAKE_CURRENT_BINARY_DIR}/libidacpp)
 else()
-    message(STATUS "Fetching idacpp from github.com/allthingsida/libidacpp...")
     include(FetchContent)
     FetchContent_Declare(
-        idacpp
+        libidacpp
         GIT_REPOSITORY https://github.com/allthingsida/libidacpp.git
         GIT_TAG main
-        SOURCE_DIR ${IDACPP_LOCAL_PATH}
     )
-    FetchContent_MakeAvailable(idacpp)
+    FetchContent_MakeAvailable(libidacpp)
 endif()
 
 # Convert paths to native format
 set(SAMPLE_IDB "${IDA_CMAKE_DIR}/samples/wizmo32.exe.i64")
 file(TO_NATIVE_PATH "${SAMPLE_IDB}" SAMPLE_IDB)
 
-# Disabled sources
-list(APPEND DISABLED_SOURCES utils_impl.cpp)
-set_source_files_properties(${DISABLED_SOURCES} PROPERTIES LANGUAGE "")
-
 # Add plugin
 ida_add_plugin(qscripts
     SOURCES
         qscripts.cpp
-        ida.h
+        qscripts_monitor.cpp
         script.hpp
-        ${DISABLED_SOURCES}
+        qscripts_utils.h
+        qscripts_expander.h
+        qscripts_deps.h
+        qscripts_monitor.h
     DEBUG_ARGS
         "${SAMPLE_IDB}"
 )
 
-target_link_libraries(qscripts PRIVATE idacpp::idacpp)
+target_link_libraries(qscripts PRIVATE libidacpp::libidacpp)

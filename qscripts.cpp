@@ -17,10 +17,33 @@ scripts in your favorite editor and execute them directly in IDA.
 #include <regex>
 #include <filesystem>
 #include <unordered_set>
-#include "ida.h"
 
-#include "utils_impl.cpp"
+#pragma warning(push)
+#pragma warning(disable: 4267 4244 4146)
+#include <loader.hpp>
+#include <idp.hpp>
+#include <expr.hpp>
+#include <prodir.h>
+#include <kernwin.hpp>
+#include <diskio.hpp>
+#include <registry.hpp>
+#include <libidacpp/kernwin/kernwin.hpp>
+#include <libidacpp/expr/expr.hpp>
+#include <libidacpp/text/text.hpp>
+
+using namespace libidacpp::kernwin;
+#pragma warning(pop)
+
+// IDA 8.3
+#ifndef CH_NOIDB
+    #define CH_NOIDB CH_UNUSED
+#endif
+
+#include "qscripts_utils.h"
 #include "script.hpp"
+#include "qscripts_expander.h"
+#include "qscripts_deps.h"
+#include "qscripts_monitor.h"
 
 //-------------------------------------------------------------------------
 // Some constants
@@ -29,7 +52,7 @@ static constexpr char IDAREG_RECENT_SCRIPTS[]   = "RecentScripts";
 
 //-------------------------------------------------------------------------
 // Non-modal scripts chooser
-struct qscripts_chooser_t: public plugmod_t, public chooser_t
+struct qscripts_chooser_t: public plugmod_t, public chooser_t, public monitor_host_t
 {
     using chooser_t::operator delete;
     using chooser_t::operator new;
@@ -39,7 +62,6 @@ private:
 
     bool m_b_filemon_timer_active = false;
     qtimer_t m_filemon_timer = nullptr;
-    const std::regex RE_EXPANDER = std::regex(R"(\$(.+?)\$)");
 
     int opt_change_interval  = 500;
     int opt_clear_log        = 0;
@@ -47,20 +69,13 @@ private:
     int opt_exec_unload_func = 0;
     int opt_with_undo        = 0;
 
-    active_script_info_t selected_script;
+    // The file-monitor engine owns the active script + its dependency graph and the
+    // "what changed -> what to run" tick. This chooser is its host (see the
+    // monitor_host_t overrides below): the engine calls back here for the few
+    // IDA-effectful operations (running a script, running a /reload, refreshing,
+    // logging), and reads/writes its active-script state via m_monitor.active().
+    script_monitor_t m_monitor { *this };
     script_info_t* action_active_script = nullptr;
-
-    struct expand_ctx_t
-    {
-        // input
-        qstring script_file;
-        bool    main_file;
-
-        // working
-        qstring base_dir;
-        qstring pkg_base;
-        qstring reload_cmd;
-    };
 
     inline int normalize_filemon_interval(const int change_interval) const
     {
@@ -69,304 +84,50 @@ private:
 
     const char *get_selected_script_file()
     {
-        return selected_script.file_path.c_str();
-    }
-
-    bool make_meta_filename(
-        const char* filename,
-        const char* extension,
-        qstring& out,
-        bool local_only = false)
-    {
-        // Check the .qscripts folder
-        char dir[2048];
-        if (qdirname(dir, sizeof(dir), filename))
-        {
-            out.sprnt("%s" SDIRCHAR QSCRIPTS_LOCAL SDIRCHAR "%s.%s", dir, qbasename(filename), extension);
-            if (qfileexist(out.c_str()))
-                return true;
-        }
-
-        if (local_only)
-            return false;
-
-        // Check the actual script folder
-        out.sprnt("%s.%s", filename, extension);
-        return qfileexist(out.c_str());
-    }
-
-    bool find_deps_file(
-        const char* filename,
-        qstring& out)
-    {
-        return      make_meta_filename(filename, "deps", out, true)
-                ||  make_meta_filename(filename, "deps.qscripts", out);
-
-    }
-    
-    bool parse_deps_for_script(expand_ctx_t &ctx)
-    {
-        // Parse the dependency index file
-        qstring dep_file;
-        if (!find_deps_file(ctx.script_file.c_str(), dep_file))
-            return false;
-
-        FILE *fp = qfopen(dep_file.c_str(), "r");
-        if (fp == nullptr)
-            return false;
-
-        // Get the dependency file directory
-        ctx.base_dir.resize(ctx.script_file.size());
-        qdirname(ctx.base_dir.begin(), ctx.base_dir.size(), ctx.script_file.c_str());
-        ctx.base_dir.resize(strlen(ctx.base_dir.c_str()));
-
-        // Add the dependency file to the active script
-        selected_script.add_dep_index(dep_file.c_str());
-
-        static auto get_value = [](const char* str, const char* key, int key_len) -> const char *
-        {
-            if (strncmp(str, key, key_len) != 0)
-                return nullptr;
-            // Empty value?
-            if (str[key_len] == '\0')
-                return "";
-            else
-                return str + key_len + 1;
-        };
-
-        // Parse each line
-        for (qstring line = dep_file; qgetline(&line, fp) != -1;)
-        {
-            line.trim2();
-
-            // Skip comment lines (';', '//' and '#')
-            if (line.empty() || strncmp(line.c_str(), "//", 2) == 0 || line[0] == '#' || line[0] == ';')
-                continue;
-
-            // Parse special directives (some apply only for the main selected script)
-            if (auto val = get_value(line.c_str(), "/pkgbase", 8))
-            {
-                if (ctx.main_file)
-                {
-                    ctx.pkg_base = val;
-                    expand_file_name(ctx.pkg_base, ctx);
-                    make_abs_path(ctx.pkg_base, ctx.base_dir.c_str(), true);
-                }
-                continue;
-            }
-            else if (auto val = get_value(line.c_str(), "/notebook.cells_re", 18))
-            {
-                if (ctx.main_file)
-                {
-                    selected_script.notebook.cells_re = std::regex(val);
-                    continue;
-                }
-            }
-            else if (auto val = get_value(line.c_str(), "/notebook.activate", 18))
-            {
-                if (ctx.main_file)
-                {
-                    int act;
-                    if (qstrcmp(val, "exec_main") == 0)
-                        act = notebook_ctx_t::act_exec_main;
-                    else if (qstrcmp(val, "exec_all") == 0)
-                        act = notebook_ctx_t::act_exec_all;
-                    else
-                        act = notebook_ctx_t::act_exec_none;
-
-                    selected_script.notebook.activation_action = act;
-                    continue;
-                }
-            }
-            else if (auto val = get_value(line.c_str(), "/notebook", 9))
-            {
-                if (ctx.main_file)
-                {
-                    selected_script.b_is_notebook = true;
-                    selected_script.notebook.title = val;
-                    continue;
-                }
-            }
-            else if (auto val = get_value(line.c_str(), "/reload", 7))
-            {
-                if (ctx.main_file)
-                    ctx.reload_cmd = val;
-                continue;
-            }
-            else if (auto trigger_file = get_value(line.c_str(), "/triggerfile", 12))
-            {
-                if (auto keep = get_value(trigger_file, "/keep", 5))
-                {
-                    trigger_file = keep;
-                    selected_script.b_keep_trigger_file = true;
-                }
-
-                if (ctx.main_file)
-                {
-                    selected_script.trigger_file.refresh(trigger_file);
-                    expand_file_name(selected_script.trigger_file.file_path, ctx);
-                }
-                continue;
-            }
-
-            // From here on, the *line* variable is an expandable string leading to a script file
-            ctx.script_file = line;
-            expand_file_name(line, ctx);
-            normalize_path_sep(line);
-
-            // Skip dependency scripts that (do not|no longer) exist
-            script_info_t dep_script;
-            if (!get_file_modification_time(line, &dep_script.modified_time))
-                continue;
-
-            // Add script
-            dep_script.file_path  = line.c_str();
-            dep_script.reload_cmd = ctx.reload_cmd;
-            dep_script.pkg_base   = ctx.pkg_base;
-
-            selected_script.dep_scripts[line.c_str()] = std::move(dep_script);
-
-            expand_ctx_t sub_ctx = ctx;
-            sub_ctx.script_file  = line;
-            sub_ctx.main_file    = false;
-            parse_deps_for_script(sub_ctx);
-        }
-        qfclose(fp);
-
-        return true;
-    }
-
-    void expand_file_name(qstring &filename, const expand_ctx_t &ctx)
-    {
-        expand_string(filename, filename, ctx);
-        make_abs_path(filename, ctx.base_dir.c_str(), true);
-    }
-
-    void populate_initial_notebook_cells()
-    {
-        auto& cell_files = selected_script.notebook.cell_files;
-        auto current_path = std::filesystem::path(selected_script.file_path.c_str()).parent_path();
-        selected_script.notebook.base_path = current_path.string();
-
-        enumerate_files(
-            current_path, 
-            selected_script.notebook.cells_re, 
-            [&cell_files](const std::string& filename)
-            {
-                qtime64_t mtime;
-                get_file_modification_time(filename, &mtime);
-                cell_files[filename] = mtime;
-                return true;
-            }
-        );
-    }
-    
-    void set_selected_script(script_info_t &script)
-    {
-        // Activate a new script
-        selected_script.clear();
-        selected_script.refresh(script.file_path.c_str());
-
-        // Recursively parse the dependencies and the index files
-        expand_ctx_t main_ctx = { script.file_path.c_str(), true };
-        parse_deps_for_script(main_ctx);
-
-        // If a notebook is selected, let's capture all the cell files
-        if (selected_script.is_notebook())
-            populate_initial_notebook_cells();
+        return m_monitor.active().file_path.c_str();
     }
 
     void clear_selected_script()
     {
-        action_active_script = nullptr;
-        selected_script.clear();
-        // ...and deactivate the monitor
-        activate_monitor(false);
+        m_monitor.clear_selected();
     }
 
     const bool has_selected_script()
     {
-        return !selected_script.file_path.empty();
+        return m_monitor.has_selected();
     }
 
     bool is_monitor_active()          const { return m_b_filemon_timer_active; }
     bool is_filemon_timer_installed() const { return m_filemon_timer != nullptr; }
 
-    std::string expand_pkgmodname(const expand_ctx_t& ctx)
+    //
+    // monitor_host_t: the IDA-effectful operations the engine delegates to us.
+    //
+    bool exec_script(script_info_t &si, bool with_undo) override
     {
-        auto dep_file = selected_script.has_dep(ctx.script_file.c_str());
-        qstring pkg_base = dep_file == nullptr ? selected_script.pkg_base : dep_file->pkg_base;
-
-        // If the script file is in the package base, then replace the path separators with '.'
-        if (strncmp(ctx.script_file.c_str(), pkg_base.c_str(), pkg_base.length()) == 0)
-        {
-            qstring s = ctx.script_file.c_str() + pkg_base.length() + 1;
-            s.replace(SDIRCHAR, ".");
-            // Drop the extension too
-            auto idx = s.rfind('.');
-            if (idx != -1)
-                s.resize(idx);
-
-            return s.c_str();
-        }
-        return "";
+        return execute_script(&si, with_undo);
     }
-    
-    // Dynamic string expansion   Description
-    // ------------------------   -----------
-    // basename                   Returns the basename of the input file
-    // env:Variable_Name          Expands the 'Variable_Name'
-    // pkgbase                    Sets the current pkgbase path
-    // pkgmodname                 Expands the file name using the pkgbase into the form: 'module.submodule1.submodule2'
-    // pkgparentmodname           Expands the file name using the pkgbase into the form up to the parent module: 'module.submodule1'
-    // ext                        Add-on suffix including bitness and extension (example: 64.dll, .so, 64.so, .dylib, etc.)
-    void expand_string(
-        qstring &input, 
-        qstring &output, 
-        const expand_ctx_t& ctx)
+    bool exec_reload(script_info_t &dep, qstring &err) override
     {
-        output = std::regex_replace(
-            input.c_str(),
-            RE_EXPANDER,
-            [this, ctx](auto &m) -> std::string
-            {
-                qstring match1 = m.str(1).c_str();
-
-                if (strncmp(match1.c_str(), "pkgmodname", 10) == 0)
-                {
-					return expand_pkgmodname(ctx);
-                }
-                else if (strncmp(match1.c_str(), "pkgparentmodname", 16) == 0)
-                {
-                    std::string pkgmodname = expand_pkgmodname(ctx);
-                    size_t pos = pkgmodname.rfind('.');
-                    return pos == std::string::npos ? pkgmodname : pkgmodname.substr(0, pos);
-                }
-                else if (strncmp(match1.c_str(), "ext", 3) == 0)
-                {
-                    static_assert(LOADER_DLL[0] == '*');
-                    return LOADER_DLL + 1;
-                }
-                else if (strncmp(match1.c_str(), "pkgbase", 7) == 0)
-                {
-                    return ctx.pkg_base.c_str();
-                }
-                else if (strncmp(match1.c_str(), "basename", 8) == 0)
-                {
-                    char *basename, *ext;
-                    qstring wrk_str;
-                    get_basename_and_ext(ctx.script_file.c_str(), &basename, &ext, wrk_str);
-                    return basename;
-                }
-                else if (strncmp(match1.c_str(), "env:", 4) == 0)
-                {
-                    qstring env;
-                    if (qgetenv(match1.begin() + 4, &env))
-                        return env.c_str();
-                }
-                return m.str(1);
-            }
-        ).c_str();
+        return execute_reload_directive(dep, err, false);
+    }
+    void refresh_view() override
+    {
+        refresh_chooser(QSCRIPTS_TITLE);
+    }
+    void log(const char *text) override
+    {
+        msg("%s", text);
+    }
+    bool monitor_active() const override
+    {
+        return m_b_filemon_timer_active;
+    }
+    void on_selected_cleared() override
+    {
+        action_active_script = nullptr;
+        // ...and deactivate the monitor
+        activate_monitor(false);
     }
 
     bool execute_reload_directive(
@@ -386,11 +147,10 @@ private:
                 break;
             }
 
-            qstring reload_cmd;
             expand_ctx_t ctx;
             ctx.script_file = script_file;
             ctx.pkg_base = dep_script_file.pkg_base;
-            expand_string(dep_script_file.reload_cmd, reload_cmd, ctx);
+            qstring reload_cmd = m_monitor.expand(dep_script_file.reload_cmd, ctx);
 
             if (!elang->eval_snippet(reload_cmd.c_str(), &err))
             {
@@ -521,7 +281,7 @@ private:
             {OPTID_CLEARLOG,   "QScripts_clearlog",             VT_LONG, &opt_clear_log},
             {OPTID_SHOWNAME,   "QScripts_showscriptname",       VT_LONG, &opt_show_filename},
             {OPTID_UNLOADEXEC, "QScripts_exec_unload_func",     VT_LONG, &opt_exec_unload_func},
-            {OPTID_SELSCRIPT,  "QScripts_selected_script_name", QSTR, &selected_script.file_path},
+            {OPTID_SELSCRIPT,  "QScripts_selected_script_name", QSTR, &m_monitor.active().file_path},
             {OPTID_WITHUNDO,   "QScripts_with_undo",            VT_LONG, &opt_with_undo}
         };
 
@@ -565,177 +325,8 @@ private:
 
     static int idaapi s_filemon_timer_cb(void *ud)
     {
-        return ((qscripts_chooser_t *)ud)->filemon_timer_cb();
-    }
-
-    // Monitor callback
-    int filemon_timer_cb()
-    {
-        do
-        {
-            // No active script, do nothing
-            if (!is_monitor_active() || !has_selected_script())
-                break;
-
-            std::unique_ptr<active_script_info_t> notebook_cell_script;
-            active_script_info_t* work_script = &selected_script;
-
-            //
-            // Handle dependencies first
-            // 
-
-            // Check if the active script or its dependencies are changed:
-            // 1. Dependency file --> repopulate it and execute active script
-            // 2. Any dependencies --> reload if needed and //
-            // 3. Active script --> execute it again
-            auto& dep_scripts = selected_script.dep_scripts;
-
-            // Let's check the dependencies index files first
-            auto mod_stat = selected_script.is_any_dep_index_modified();
-            if (mod_stat == filemod_status_e::modified)
-            {
-                // Force re-parsing of the index file
-                dep_scripts.clear();
-                set_selected_script(selected_script);
-
-                // Let's invalidate all the scripts time stamps so we ensure they are re-interpreted again
-                selected_script.invalidate_all_scripts();
-
-                // Refresh the UI
-                refresh_chooser(QSCRIPTS_TITLE);
-
-                // Just leave and come back fast so we get a chance to re-evaluate everything
-                return 1; // (1 ms)
-            }
-            // Dependency index file is gone
-            else if (mod_stat == filemod_status_e::not_found && !dep_scripts.empty())
-            {
-                // Let's just check the active script
-                dep_scripts.clear();
-            }
-
-            //
-            // Check the dependency scripts
-            //
-            bool dep_script_changed = false;
-            bool brk = false;
-            for (auto& kv : dep_scripts)
-            {
-                auto& dep_script = kv.second;
-                if (dep_script.get_modification_status() == filemod_status_e::modified)
-                {
-                    qstring err;
-                    dep_script_changed = true;
-                    if (dep_script.has_reload_directive()
-                        && !execute_reload_directive(dep_script, err, false))
-                    {
-                        brk = true;
-                        break;
-                    }
-                }
-            }
-            if (brk)
-                break;
-
-            //
-            // Notebook mode
-            //
-            if (selected_script.is_notebook())
-            {
-                auto& last_active_cell = selected_script.notebook.last_active_cell;
-                auto& cell_files = selected_script.notebook.cell_files;
-                auto current_path = std::filesystem::path(selected_script.file_path.c_str()).parent_path();
-                std::unordered_set<std::string> present_files;
-
-                std::string active_cell;
-                enumerate_files(
-                    current_path, 
-                    selected_script.notebook.cells_re, 
-                    [&present_files, &last_active_cell, &active_cell, &cell_files](const std::string& filename)
-                    {
-                        present_files.insert(filename);
-                        auto p = cell_files.find(filename);
-
-                        qtime64_t mtime;
-                        get_file_modification_time(filename.c_str(), &mtime);
-
-                        // New file?
-                        if (p == cell_files.end())
-                        {
-                            cell_files[filename] = mtime;
-                        }
-                        // File was modified?
-                        else if (p->second != mtime)
-                        {
-                            last_active_cell = active_cell = filename;
-                            p->second = mtime;
-                            // Stop enumeration; next interval we pick up the rest
-                            return false;
-                        }
-                        return true;
-                    }
-                );
-
-                // Remove missing files from cell_files
-                for (auto it = cell_files.begin(); it != cell_files.end();)
-                {
-                    if (present_files.find(it->first) == present_files.end())
-                        it = cell_files.erase(it);
-                    else
-                        ++it;
-                }
-
-                // We have to always execute a script when a dependency changes:
-                // - If a dependency has changed, but no active cells changedthen attempt to use the last active cell.
-                if (dep_script_changed && active_cell.empty())
-                    active_cell = selected_script.notebook.last_active_cell;
-
-                // If no modified cell files, then do nothing
-                if (!active_cell.empty())
-                {
-                    // ...use the same metadata as the notebook main script, but just execute the given cell
-                    notebook_cell_script.reset(new active_script_info_t(selected_script));
-                    work_script = notebook_cell_script.get();
-                    work_script->file_path = active_cell.c_str();
-                }
-            }
-            //
-            // Trigger mode
-            // 
-            // In trigger file mode, just wait for the trigger file to be created
-            else if (selected_script.trigger_based())
-            {
-                // The monitor waits until the trigger file is created or modified
-                auto trigger_status = selected_script.trigger_file.get_modification_status(true);
-                if (trigger_status != filemod_status_e::modified)
-                    break;
-
-                // Delete the trigger file
-                if (!selected_script.b_keep_trigger_file)
-                    qunlink(selected_script.trigger_file.c_str());
-
-                // Always execute the main script even if it was not changed
-                selected_script.invalidate();
-                // ...and proceed with QScript logic
-            }
-
-            // Check the main script
-            mod_stat = work_script->get_modification_status();
-            if (mod_stat == filemod_status_e::not_found)
-            {
-                // Script no longer exists
-                msg(
-                    "QScripts detected that the active script '%s' no longer exists!\n", 
-                    work_script->file_path.c_str());
-                clear_selected_script();
-                break;
-            }
-
-            // Script or its dependencies changed?
-            if (dep_script_changed || mod_stat == filemod_status_e::modified)
-                execute_script(work_script, opt_with_undo);
-        } while (false);
-        return opt_change_interval;
+        auto self = (qscripts_chooser_t *)ud;
+        return self->m_monitor.tick(self->opt_with_undo != 0, self->opt_change_interval);
     }
 
 protected:
@@ -868,7 +459,7 @@ protected:
             if (is_monitor_active())
             {
                 attrs->flags = CHITEM_BOLD;
-                *icon = selected_script.is_notebook() ? IDAICONS::NOTEPAD_1 : IDAICONS::KEYBOARD_GRAY;
+                *icon = m_monitor.active().is_notebook() ? IDAICONS::NOTEPAD_1 : IDAICONS::KEYBOARD_GRAY;
             }
             else
             {
@@ -876,7 +467,7 @@ protected:
                 *icon = IDAICONS::RED_DOT;
             }
         }
-        else if (is_monitor_active() && selected_script.has_dep(si->file_path) != nullptr)
+        else if (is_monitor_active() && m_monitor.active().has_dep(si->file_path) != nullptr)
         {
             // Mark as a dependency
             *icon = IDAICONS::EYE_GLASSES_EDIT;
@@ -896,9 +487,10 @@ protected:
         m_nselected = n;
 
         // Set as the selected script and execute it
-        set_selected_script(m_scripts[n]);
+        m_monitor.set_selected(m_scripts[n].file_path.c_str());
+        auto &selected_script = m_monitor.active();
 
-        if (   selected_script.is_notebook() 
+        if (   selected_script.is_notebook()
             && selected_script.notebook.activation_action == notebook_ctx_t::act_exec_none)
         {
             // Notebook, execute nothing on activation
@@ -909,7 +501,7 @@ protected:
                  && selected_script.notebook.activation_action == notebook_ctx_t::act_exec_all)
         {
             // Notebook, execute all scripts on activation
-            msg("Executing all scripts for notebook: %s\n", 
+            msg("Executing all scripts for notebook: %s\n",
                 selected_script.notebook.title.c_str());
 
             execute_notebook_cells(&selected_script);
@@ -971,8 +563,7 @@ protected:
     static void get_browse_scripts_filter(qstring &filter)
     {
         // Collect all installed external languages
-        extlangs_t langs;
-        collect_extlangs(&langs, false);
+        auto langs = libidacpp::expr::collect_extlangs(false);
 
         // Build the filter
         filter = "FILTER Script files|";
@@ -1040,6 +631,7 @@ protected:
             {
                 if (is_monitor_active())
                 {
+                    auto &selected_script = m_monitor.active();
                     script_info_t* work_script = nullptr;
                     std::unique_ptr<active_script_info_t> cell_script;
                     if (selected_script.is_notebook())
@@ -1074,8 +666,8 @@ protected:
             ),
             FO_ACTION_ACTIVATE([this]) 
             {
-                if (this->has_selected_script() && selected_script.is_notebook())
-                    this->execute_notebook_cells(&selected_script);
+                if (this->has_selected_script() && m_monitor.active().is_notebook())
+                    this->execute_notebook_cells(&m_monitor.active());
                 return 1;
             },
             "An action to programmatically execute the active script",
@@ -1139,7 +731,7 @@ public:
     void execute_last_selected_script(bool with_undo=false)
     {
         if (has_selected_script())
-            execute_script(&selected_script, with_undo);
+            execute_script(&m_monitor.active(), with_undo);
     }
 
     void execute_script_at(ssize_t n)
