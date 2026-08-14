@@ -21,13 +21,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Every job builds with THIS repo's ida-cmake, installed at $IDASDK/ida-cmake
-# (cloned from allthingsida/ida-cmake), never the SDK's own src/cmake. The SDK is
-# pinned per IDA version so we generate artifacts for 9.2 / 9.3 / 9.4.
+# hcli / IDA Plugin Manager packaging (see kb-ati/references/hcli-cpp-plugins.md):
+# each release asset is a FLAT per-IDA-version zip -> ida-plugin.json (idaVersions "==<ver>")
+# + qscripts.{dll,so,dylib} at the zip root (macOS universal). hcli auto-installs those.
+# Windows/Linux ARM64 aren't representable in hcli yet (HexRaysSA/ida-hcli#209), so we still
+# BUILD them and carry them in the same zip renamed qscripts_aarch64.{dll,so} — lint-clean,
+# ignored by hcli today (manual install), forward-compatible if #209 adds arch-suffix resolution.
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }}, ${{ matrix.sdk }})
+  # Mainstream plugin binaries (win-x64, linux-x64, macOS-universal) per IDA version.
+  plugin:
+    name: Plugin (${{ matrix.os }}, ${{ matrix.sdk }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -38,15 +42,12 @@ jobs:
           - os: Linux
             runner: ubuntu-latest
             ext: so
-            arch: x64
           - os: macOS
-            runner: macos-latest    # Apple Silicon (arm64)
+            runner: macos-latest
             ext: dylib
-            arch: arm64
           - os: Windows
             runner: windows-latest
             ext: dll
-            arch: x64
     env:
       IDASDK: ${{ github.workspace }}/ida-sdk
     steps:
@@ -65,69 +66,67 @@ jobs:
           if [ "${{ matrix.os }}" = "Windows" ]; then
             cmake -S . -B build -A x64
             cmake --build build --config Release --parallel
+          elif [ "${{ matrix.os }}" = "macOS" ]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+            cmake --build build --parallel
           else
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
             cmake --build build --parallel
           fi
 
-      - name: Stage artifact
+      - name: Stage plugin + version-stamped metadata
         shell: bash
         run: |
+          set -euo pipefail
+          case "${{ matrix.sdk }}" in
+            v9.2.0-sdk.1)   IDA=9.2 ;;
+            v9.3.1-sdk.1)   IDA=9.3 ;;
+            v9.4.0-release) IDA=9.4 ;;
+            *) echo "unknown sdk"; exit 1 ;;
+          esac
+          echo "IDA=$IDA" >> "$GITHUB_ENV"
           mkdir -p out
-          cp "${IDASDK}/src/bin/plugins/qscripts.${{ matrix.ext }}" \
-             "out/qscripts-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.sdk }}.${{ matrix.ext }}"
-          ls -la out
+          cp "${IDASDK}/src/bin/plugins/qscripts.${{ matrix.ext }}" out/
+          jq ".plugin.idaVersions = \"==${IDA}\"" ida-plugin.json > out/ida-plugin.json
+          ls -l out
 
-      - name: Upload artifact
+      - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qscripts-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.sdk }}
+          name: plugin-ida${{ env.IDA }}-${{ matrix.os }}
           path: out/*
+          if-no-files-found: error
 
-  # Native Windows-on-ARM build on a real ARM64 runner. ARM64 Windows libs exist only in SDK 9.4.
-  windows-arm64:
-    name: Build (Windows ARM64 native, v9.4.0-release)
-    runs-on: windows-11-arm
-    env:
-      IDASDK: ${{ github.workspace }}/ida-sdk
-    steps:
-      - name: Checkout qscripts
-        uses: actions/checkout@v4
-
-      - name: Setup IDA SDK 9.4 + our ida-cmake
-        shell: bash
-        run: |
-          git clone --branch v9.4.0-release --depth 1 https://github.com/HexRaysSA/ida-sdk ida-sdk
-          git clone --depth 1 https://github.com/allthingsida/ida-cmake "${IDASDK}/ida-cmake"
-
-      - name: Configure & build (ARM64)
-        shell: bash
-        run: |
-          cmake -S . -B build -A ARM64
-          cmake --build build --config Release --parallel
-
-      - name: Stage artifact
-        shell: bash
-        run: |
-          # Native build (host==target) deploys to the SDK plugins dir.
-          mkdir -p out
-          cp "${IDASDK}/src/bin/plugins/qscripts.dll" out/qscripts-Windows-arm64-v9.4.0-release.dll
-          ls -la out
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: qscripts-Windows-arm64-v9.4.0-release
-          path: out/*
-
-  # Native Linux ARM64 build. arm64_linux libs ship in SDK 9.3.1-sdk.1 and later (not 9.2).
-  linux-arm64:
-    name: Build (Linux ARM64 native, ${{ matrix.sdk }})
-    runs-on: ubuntu-24.04-arm
+  # Native ARM64 plugin binaries, carried in the same zip as qscripts_aarch64.<ext>.
+  # (win-arm64 libs exist in 9.4; linux-arm64 in 9.3+.)
+  plugin-arm:
+    name: Plugin ARM (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        sdk: [v9.3.1-sdk.1, v9.4.0-release]
+        include:
+          - label: linux-arm64-ida9.3
+            runner: ubuntu-24.04-arm
+            sdk: v9.3.1-sdk.1
+            ida: "9.3"
+            src: qscripts.so
+            dst: qscripts_aarch64.so
+            winarm: "no"
+          - label: linux-arm64-ida9.4
+            runner: ubuntu-24.04-arm
+            sdk: v9.4.0-release
+            ida: "9.4"
+            src: qscripts.so
+            dst: qscripts_aarch64.so
+            winarm: "no"
+          - label: windows-arm64-ida9.4
+            runner: windows-11-arm
+            sdk: v9.4.0-release
+            ida: "9.4"
+            src: qscripts.dll
+            dst: qscripts_aarch64.dll
+            winarm: "yes"
     env:
       IDASDK: ${{ github.workspace }}/ida-sdk
     steps:
@@ -140,66 +139,77 @@ jobs:
           git clone --branch ${{ matrix.sdk }} --depth 1 https://github.com/HexRaysSA/ida-sdk ida-sdk
           git clone --depth 1 https://github.com/allthingsida/ida-cmake "${IDASDK}/ida-cmake"
 
-      - name: Configure & build
+      - name: Configure & build (ARM64)
         shell: bash
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel
+          if [ "${{ matrix.winarm }}" = "yes" ]; then
+            cmake -S . -B build -A ARM64
+            cmake --build build --config Release --parallel
+          else
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --parallel
+          fi
 
-      - name: Stage artifact
+      - name: Stage arm binary (renamed)
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
-          cp "${IDASDK}/src/bin/plugins/qscripts.so" out/qscripts-Linux-arm64-${{ matrix.sdk }}.so
-          ls -la out
+          cp "${IDASDK}/src/bin/plugins/${{ matrix.src }}" "out/${{ matrix.dst }}"
+          ls -l out
 
-      - name: Upload artifact
+      - name: Upload arm artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qscripts-Linux-arm64-${{ matrix.sdk }}
+          name: pluginarm-ida${{ matrix.ida }}-${{ matrix.label }}
           path: out/*
+          if-no-files-found: error
 
   publish-release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [build, windows-arm64, linux-arm64]
+    needs: [plugin, plugin-arm]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Checkout qscripts
-        uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: qscripts-*
-          path: dist
-          merge-multiple: true
+          path: artifacts
 
-      - name: Package per-IDA-version zips
+      - name: Assemble flat hcli plugin zips (per IDA version)
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
-          # Map SDK tag -> IDA version used in the zip name.
-          declare -A IDAVER=( [v9.2.0-sdk.1]=9.2 [v9.3.1-sdk.1]=9.3 [v9.4.0-release]=9.4 )
           mkdir -p out
-          cd dist
-          # Stage each binary into ida<ver>/<os>-<arch>/qscripts.<ext>
-          for f in qscripts-*-*-*.*; do
-            base="${f#qscripts-}"; os="${base%%-*}"; rest="${base#*-}"
-            arch="${rest%%-*}"; rest2="${rest#*-}"; ext="${rest2##*.}"; sdk="${rest2%.*}"
-            ida="${IDAVER[$sdk]:-}"
-            if [ -z "$ida" ]; then echo "skip (unknown SDK): $f"; continue; fi
-            osl="$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')"
-            d="ida${ida}/${osl}-${arch}"; mkdir -p "$d"; cp "$f" "$d/qscripts.${ext}"
+          for ida in 9.2 9.3 9.4; do
+            rm -rf stage && mkdir -p stage
+            found=0
+            # mainstream binaries + stamped ida-plugin.json
+            for d in artifacts/plugin-ida${ida}-*/; do
+              [ -d "$d" ] || continue
+              cp -v "$d"/* stage/
+              found=1
+            done
+            [ "$found" = "1" ] || { echo "no mainstream artifacts for ida${ida}"; continue; }
+            # arm binaries carried in-zip (already renamed qscripts_aarch64.<ext>), if any for this version
+            for d in artifacts/pluginarm-ida${ida}-*/; do
+              [ -d "$d" ] && cp -v "$d"/* stage/ || true
+            done
+            ( cd stage && zip -r "../out/qscripts-ida${ida}.zip" . )
           done
-          # One zip per IDA version, each with ida-plugin.json at the root.
-          for d in ida*/; do
-            ida="${d%/}"; cp ../ida-plugin.json "$ida/"
-            ( cd "$ida" && zip -9 -r "../../out/qscripts-${TAG}-${ida}.zip" . )
+          echo "=== assets ==="; ls -l out
+          echo "=== example contents ==="; unzip -l out/qscripts-ida9.4.zip || true
+
+      - name: Lint plugin zips with hcli
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet ida-hcli || pipx install ida-hcli || { echo "hcli install failed; skipping lint"; exit 0; }
+          for z in out/qscripts-ida*.zip; do
+            echo "=== hcli plugin lint $z ==="
+            hcli plugin lint "$z" || echo "lint reported issues for $z (review)"
           done
-          cd ..
-          echo "=== release assets ==="; ls -lh out
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -209,4 +219,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: out/qscripts-${{ github.ref_name }}-ida*.zip
+          files: out/qscripts-ida*.zip

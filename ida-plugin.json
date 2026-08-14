@@ -21,8 +21,8 @@
     "idaVersions": ">=9.2",
     "platforms": [
       "windows-x86_64",
-      "windows-arm64",
       "linux-x86_64",
+      "macos-x86_64",
       "macos-aarch64"
     ],
     "license": "LicenseRef-Human-Origin-Source-1.0"
